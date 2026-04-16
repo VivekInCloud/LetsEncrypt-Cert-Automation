@@ -1,0 +1,86 @@
+name: LetsEncrypt ACME Cert Automation - SBX
+
+on:
+  schedule:
+    - cron: '0 2 1 * *'   # Monthly
+  workflow_dispatch:        # Manual trigger anytime
+
+jobs:
+  cert-automation:
+    runs-on: [self-hosted, your-runner]
+
+    env:
+      AZUREDNS_TENANTID: ${{ secrets.AZURE_TENANT_ID }}
+      AZUREDNS_APPID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZUREDNS_CLIENTSECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZUREDNS_SUBSCRIPTIONID: "your-subscription-id"
+
+    steps:
+      - name: Install acme.sh if not present
+        run: |
+          if [ ! -f "$HOME/.acme.sh/acme.sh" ]; then
+            curl https://get.acme.sh | sh -s email=cloudservices@yourdomain.com
+            source "$HOME/.acme.sh/acme.sh.env"
+          fi
+
+      - name: Issue SBX SAN Cert
+        run: |
+          export PATH="$HOME/.acme.sh:$PATH"
+          acme.sh --issue --dns dns_azure --keylength 4096 \
+            -d "*.sbx.yourdomain.com" \
+            --server letsencrypt --force > /tmp/acme.log 2>&1 \
+            && echo "PASS - Cert issued successfully" \
+            || { echo "FAIL - Check runner logs at /tmp/acme.log"; exit 1; }
+
+      - name: Convert to PFX
+        run: |
+          openssl pkcs12 -export -legacy \
+            -out sbx-san-cert.pfx \
+            -inkey "$HOME/.acme.sh/*.sbx.yourdomain.com/*.sbx.yourdomain.com.key" \
+            -in "$HOME/.acme.sh/*.sbx.yourdomain.com/fullchain.cer" \
+            -passout pass:""
+
+      - name: Validate Certificate Chain
+        run: |
+          echo "Validating certificate..."
+          openssl version
+
+          openssl pkcs12 -legacy -in sbx-san-cert.pfx -nokeys -passin pass:"" 2>/dev/null \
+            | openssl x509 -noout -checkend 0 \
+            && echo "PASS - Cert is valid and not expired" \
+            || { echo "FAIL - Cert is expired or invalid"; exit 1; }
+
+          openssl pkcs12 -legacy -in sbx-san-cert.pfx -nokeys -passin pass:"" 2>/dev/null \
+            | openssl x509 -noout -ext subjectAltName \
+            | grep -q "sbx.yourdomain.com" \
+            && echo "PASS - Domain confirmed" \
+            || { echo "FAIL - Domain mismatch"; exit 1; }
+
+          openssl pkcs12 -legacy -in sbx-san-cert.pfx -nocerts \
+            -passin pass:"" -passout pass:"" 2>/dev/null \
+            | openssl rsa -noout -text 2>/dev/null \
+            | grep "Private-Key" || true
+
+          echo "All validations passed. Safe to push to Key Vault."
+
+      - name: Login to Azure
+        run: |
+          az login --service-principal \
+            --username ${{ secrets.AZURE_CLIENT_ID }} \
+            --password ${{ secrets.AZURE_CLIENT_SECRET }} \
+            --tenant ${{ secrets.AZURE_TENANT_ID }}
+
+      - name: Push Cert to Key Vault
+        run: |
+          az keyvault certificate import \
+            --vault-name your-keyvault-name \
+            --name "wildcard-san-cert" \
+            --file sbx-san-cert.pfx \
+            --output none \
+            && echo "PASS - Cert pushed to Key Vault successfully" \
+            || { echo "FAIL - Cert push failed"; exit 1; }
+
+      - name: Cleanup
+        run: |
+          rm -f sbx-san-cert.pfx
+          az logout
